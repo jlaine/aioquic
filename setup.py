@@ -53,6 +53,11 @@ setuptools.setup(
             libraries=["crypto"],
             sources=["src/aioquic/_crypto.c"],
         ),
+        setuptools.Extension(
+            "aioquic._timer",
+            extra_compile_args=extra_compile_args,
+            sources=["src/aioquic/_timer.c"],
+        ),
     ],
     package_dir={"": "src"},
     package_data={"aioquic": ["py.typed", "_buffer.pyi", "_crypto.pyi"]},

@@ -1,6 +1,7 @@
 import asyncio
 from typing import Any, Callable, Dict, Optional, Text, Tuple, Union, cast
 
+from .._timer import Timer
 from ..quic import events
 from ..quic.connection import NetworkAddress, QuicConnection
 
@@ -21,8 +22,9 @@ class QuicConnectionProtocol(asyncio.DatagramProtocol):
         self._ping_waiters: Dict[int, asyncio.Future[None]] = {}
         self._quic = quic
         self._stream_readers: Dict[int, asyncio.StreamReader] = {}
-        self._timer: Optional[asyncio.TimerHandle] = None
+        self._timer = Timer()
         self._timer_at: Optional[float] = None
+        self._timer_file = self._timer.file()
         self._transmit_task: Optional[asyncio.Handle] = None
         self._transport: Optional[asyncio.DatagramTransport] = None
 
@@ -34,6 +36,8 @@ class QuicConnectionProtocol(asyncio.DatagramProtocol):
             self._stream_handler = stream_handler
         else:
             self._stream_handler = lambda r, w: None
+
+        loop.add_reader(self._timer_file.fileno(), self._handle_timer)
 
     def change_connection_id(self) -> None:
         """
@@ -57,7 +61,7 @@ class QuicConnectionProtocol(asyncio.DatagramProtocol):
 
         This method can only be called for clients and a single time.
         """
-        self._quic.connect(addr, now=self._loop.time())
+        self._quic.connect(addr, now=self._timer.time())
         self.transmit()
 
     async def create_stream(
@@ -99,16 +103,17 @@ class QuicConnectionProtocol(asyncio.DatagramProtocol):
         self._transmit_task = None
 
         # send datagrams
-        for data, addr in self._quic.datagrams_to_send(now=self._loop.time()):
+        now = self._timer.time()
+        for data, addr in self._quic.datagrams_to_send(now=now):
             self._transport.sendto(data, addr)
 
         # re-arm timer
         timer_at = self._quic.get_timer()
-        if self._timer is not None and self._timer_at != timer_at:
-            self._timer.cancel()
-            self._timer = None
-        if self._timer is None and timer_at is not None:
-            self._timer = self._loop.call_at(timer_at, self._handle_timer)
+        if self._timer_at != timer_at:
+            if timer_at is None:
+                self._timer.settime(0)
+            else:
+                self._timer.settime(timer_at - now)
         self._timer_at = timer_at
 
     async def wait_closed(self) -> None:
@@ -132,7 +137,7 @@ class QuicConnectionProtocol(asyncio.DatagramProtocol):
         self._transport = cast(asyncio.DatagramTransport, transport)
 
     def datagram_received(self, data: Union[bytes, Text], addr: NetworkAddress) -> None:
-        self._quic.receive_datagram(cast(bytes, data), addr, now=self._loop.time())
+        self._quic.receive_datagram(cast(bytes, data), addr, now=self._timer.time())
         self._process_events()
         self.transmit()
 
@@ -164,8 +169,8 @@ class QuicConnectionProtocol(asyncio.DatagramProtocol):
         return reader, writer
 
     def _handle_timer(self) -> None:
-        now = max(self._timer_at, self._loop.time())
-        self._timer = None
+        self._timer_file.read()
+        now = max(self._timer_at, self._timer.time())
         self._timer_at = None
         self._quic.handle_timer(now=now)
         self._process_events()
