@@ -146,8 +146,7 @@ class QuicPacketBuilder:
         Returns the assembled datagrams.
         """
         if self._packet is not None:
-            self._end_packet()
-        self._flush_current_datagram()
+            self._end_packet(flushing=True)
 
         datagrams = self._datagrams
         packets = self._packets
@@ -188,18 +187,11 @@ class QuicPacketBuilder:
         """
         buf = self._buffer
 
-        # finish previous datagram
+        # Finish previous packet.
         if self._packet is not None:
-            self._end_packet()
+            self._end_packet(flushing=False)
 
-        # if there is too little space remaining, start a new datagram
-        # FIXME: the limit is arbitrary!
-        packet_start = buf.tell()
-        if self._buffer_capacity - packet_start < 128:
-            self._flush_current_datagram()
-            packet_start = 0
-
-        # initialize datagram if needed
+        # Initialize datagram if needed.
         if self._datagram_init:
             if self.max_total_bytes is not None:
                 remaining_total_bytes = self.max_total_bytes - self._total_bytes
@@ -214,7 +206,7 @@ class QuicPacketBuilder:
             self._datagram_flight_bytes = 0
             self._datagram_init = False
 
-        # calculate header size
+        # Calculate header size.
         packet_long_header = is_long_header(packet_type)
         if packet_long_header:
             header_size = 11 + len(self._peer_cid) + len(self._host_cid)
@@ -224,11 +216,12 @@ class QuicPacketBuilder:
         else:
             header_size = 3 + len(self._peer_cid)
 
-        # check we have enough space
+        # Check we have enough space.
+        packet_start = buf.tell()
         if packet_start + header_size >= self._buffer_capacity:
             raise QuicPacketBuilderStop
 
-        # determine ack epoch
+        # Determine ack epoch.
         if packet_type == PACKET_TYPE_INITIAL:
             epoch = Epoch.INITIAL
         elif packet_type == PACKET_TYPE_HANDSHAKE:
@@ -253,14 +246,14 @@ class QuicPacketBuilder:
 
         buf.seek(self._packet_start + self._header_size)
 
-    def _end_packet(self) -> None:
+    def _end_packet(self, *, flushing: bool) -> None:
         """
         Ends the current packet.
         """
         buf = self._buffer
         packet_size = buf.tell() - self._packet_start
         if packet_size > self._header_size:
-            # padding to ensure sufficient sample size
+            # Padding to ensure sufficient sample size.
             padding_size = (
                 PACKET_NUMBER_MAX_SIZE
                 - PACKET_NUMBER_SEND_SIZE
@@ -278,7 +271,7 @@ class QuicPacketBuilder:
             ):
                 padding_size = self.remaining_flight_space
 
-            # write padding
+            # Write padding.
             if padding_size > 0:
                 buf.push_bytes(bytes(padding_size))
                 packet_size += padding_size
@@ -290,7 +283,7 @@ class QuicPacketBuilder:
                         self._quic_logger.encode_padding_frame()
                     )
 
-            # write header
+            # Write header.
             if self._packet_long_header:
                 length = (
                     packet_size
@@ -322,7 +315,7 @@ class QuicPacketBuilder:
                 buf.push_bytes(self._peer_cid)
                 buf.push_uint16(self._packet_number & 0xFFFF)
 
-            # encrypt in place
+            # Encrypt in place.
             plain = buf.data_slice(self._packet_start, self._packet_start + packet_size)
             buf.seek(self._packet_start)
             buf.push_bytes(
@@ -337,14 +330,21 @@ class QuicPacketBuilder:
             if self._packet.in_flight:
                 self._datagram_flight_bytes += self._packet.sent_bytes
 
-            # short header packets cannot be coalesced, we need a new datagram
-            if not self._packet_long_header:
-                self._flush_current_datagram()
-
             self._packet_number += 1
         else:
-            # "cancel" the packet
+            # "Cancel" the packet.
             buf.seek(self._packet_start)
+
+        # We need a new datagram if either:
+        # - We have no more packets to write.
+        # - We are writing a short header packet, which cannot be coalesced.
+        # - There is too little space remaining.
+        if (
+            flushing
+            or not self._packet_long_header
+            or (self._buffer_capacity - buf.tell() < 128)
+        ):
+            self._flush_current_datagram()
 
         self._packet = None
         self.quic_logger_frames = None
