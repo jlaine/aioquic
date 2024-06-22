@@ -4,8 +4,7 @@ from unittest import TestCase
 from aioquic.buffer import Buffer, BufferReadError
 from aioquic.quic import packet
 from aioquic.quic.packet import (
-    PACKET_TYPE_INITIAL,
-    PACKET_TYPE_RETRY,
+    QuicPacketType,
     QuicPreferredAddress,
     QuicProtocolVersion,
     QuicTransportParameters,
@@ -54,9 +53,8 @@ class PacketTest(TestCase):
     def test_pull_initial_client(self):
         buf = Buffer(data=load("initial_client.bin"))
         header = pull_quic_header(buf, host_cid_length=8)
-        self.assertTrue(header.is_long_header)
         self.assertEqual(header.version, QuicProtocolVersion.VERSION_1)
-        self.assertEqual(header.packet_type, PACKET_TYPE_INITIAL)
+        self.assertEqual(header.packet_type, QuicPacketType.INITIAL)
         self.assertEqual(header.destination_cid, binascii.unhexlify("858b39368b8e3c6e"))
         self.assertEqual(header.source_cid, b"")
         self.assertEqual(header.token, b"")
@@ -73,9 +71,8 @@ class PacketTest(TestCase):
     def test_pull_initial_server(self):
         buf = Buffer(data=load("initial_server.bin"))
         header = pull_quic_header(buf, host_cid_length=8)
-        self.assertTrue(header.is_long_header)
         self.assertEqual(header.version, QuicProtocolVersion.VERSION_1)
-        self.assertEqual(header.packet_type, PACKET_TYPE_INITIAL)
+        self.assertEqual(header.packet_type, QuicPacketType.INITIAL)
         self.assertEqual(header.destination_cid, b"")
         self.assertEqual(header.source_cid, binascii.unhexlify("195c68344e28d479"))
         self.assertEqual(header.token, b"")
@@ -83,15 +80,14 @@ class PacketTest(TestCase):
         self.assertEqual(header.rest_length, 184)
         self.assertEqual(buf.tell(), 18)
 
-    def test_pull_retry(self):
+    def test_pull_retry_v1(self):
         original_destination_cid = binascii.unhexlify("fbbd219b7363b64b")
 
         data = load("retry.bin")
         buf = Buffer(data=data)
         header = pull_quic_header(buf, host_cid_length=8)
-        self.assertTrue(header.is_long_header)
         self.assertEqual(header.version, QuicProtocolVersion.VERSION_1)
-        self.assertEqual(header.packet_type, PACKET_TYPE_RETRY)
+        self.assertEqual(header.packet_type, QuicPacketType.RETRY)
         self.assertEqual(header.destination_cid, binascii.unhexlify("e9d146d8d14cb28e"))
         self.assertEqual(
             header.source_cid,
@@ -135,9 +131,8 @@ class PacketTest(TestCase):
         data = load("retry_draft_29.bin")
         buf = Buffer(data=data)
         header = pull_quic_header(buf, host_cid_length=8)
-        self.assertTrue(header.is_long_header)
         self.assertEqual(header.version, QuicProtocolVersion.DRAFT_29)
-        self.assertEqual(header.packet_type, PACKET_TYPE_RETRY)
+        self.assertEqual(header.packet_type, QuicPacketType.RETRY)
         self.assertEqual(header.destination_cid, binascii.unhexlify("e9d146d8d14cb28e"))
         self.assertEqual(
             header.source_cid,
@@ -178,9 +173,8 @@ class PacketTest(TestCase):
     def test_pull_version_negotiation(self):
         buf = Buffer(data=load("version_negotiation.bin"))
         header = pull_quic_header(buf, host_cid_length=8)
-        self.assertTrue(header.is_long_header)
         self.assertEqual(header.version, QuicProtocolVersion.NEGOTIATION)
-        self.assertEqual(header.packet_type, None)
+        self.assertEqual(header.packet_type, QuicPacketType.VERSION_NEGOTIATION)
         self.assertEqual(header.destination_cid, binascii.unhexlify("9aac5a49ba87a849"))
         self.assertEqual(header.source_cid, binascii.unhexlify("f92f4336fa951ba1"))
         self.assertEqual(header.token, b"")
@@ -229,9 +223,8 @@ class PacketTest(TestCase):
     def test_pull_short_header(self):
         buf = Buffer(data=load("short_header.bin"))
         header = pull_quic_header(buf, host_cid_length=8)
-        self.assertFalse(header.is_long_header)
         self.assertEqual(header.version, None)
-        self.assertEqual(header.packet_type, 0x50)
+        self.assertEqual(header.packet_type, QuicPacketType.ONE_RTT)
         self.assertEqual(header.destination_cid, binascii.unhexlify("f45aa7b59c0e1ad6"))
         self.assertEqual(header.source_cid, b"")
         self.assertEqual(header.token, b"")

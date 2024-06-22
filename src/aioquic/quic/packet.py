@@ -2,7 +2,7 @@ import binascii
 import ipaddress
 import os
 from dataclasses import dataclass
-from enum import IntEnum
+from enum import Enum, IntEnum
 from typing import List, Optional, Tuple
 
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
@@ -13,13 +13,6 @@ from .rangeset import RangeSet
 PACKET_LONG_HEADER = 0x80
 PACKET_FIXED_BIT = 0x40
 PACKET_SPIN_BIT = 0x20
-
-PACKET_TYPE_INITIAL = PACKET_LONG_HEADER | PACKET_FIXED_BIT | 0x00
-PACKET_TYPE_ZERO_RTT = PACKET_LONG_HEADER | PACKET_FIXED_BIT | 0x10
-PACKET_TYPE_HANDSHAKE = PACKET_LONG_HEADER | PACKET_FIXED_BIT | 0x20
-PACKET_TYPE_RETRY = PACKET_LONG_HEADER | PACKET_FIXED_BIT | 0x30
-PACKET_TYPE_ONE_RTT = PACKET_FIXED_BIT
-PACKET_TYPE_MASK = 0xF0
 
 CONNECTION_ID_MAX_SIZE = 20
 PACKET_NUMBER_MAX_SIZE = 4
@@ -51,6 +44,26 @@ class QuicErrorCode(IntEnum):
     CRYPTO_ERROR = 0x100
 
 
+class QuicPacketType(Enum):
+    INITIAL = 0
+    ZERO_RTT = 1
+    HANDSHAKE = 2
+    RETRY = 3
+    VERSION_NEGOTIATION = 4
+    ONE_RTT = 5
+
+
+PACKET_LONG_TYPE_DECODE_VERSION_1 = [
+    QuicPacketType.INITIAL,
+    QuicPacketType.ZERO_RTT,
+    QuicPacketType.HANDSHAKE,
+    QuicPacketType.RETRY,
+]
+PACKET_LONG_TYPE_ENCODE_VERSION_1 = dict(
+    (v, i) for (i, v) in enumerate(PACKET_LONG_TYPE_DECODE_VERSION_1)
+)
+
+
 class QuicProtocolVersion(IntEnum):
     NEGOTIATION = 0
     VERSION_1 = 0x00000001
@@ -62,9 +75,8 @@ class QuicProtocolVersion(IntEnum):
 
 @dataclass
 class QuicHeader:
-    is_long_header: bool
     version: Optional[int]
-    packet_type: int
+    packet_type: QuicPacketType
     destination_cid: bytes
     source_cid: bytes
     token: bytes = b""
@@ -156,31 +168,32 @@ def pull_quic_header(buf: Buffer, host_cid_length: Optional[int] = None) -> Quic
 
         if version == QuicProtocolVersion.NEGOTIATION:
             # version negotiation
-            packet_type = None
+            packet_type = QuicPacketType.VERSION_NEGOTIATION
             rest_length = buf.capacity - buf.tell()
         else:
             if not (first_byte & PACKET_FIXED_BIT):
                 raise ValueError("Packet fixed bit is zero")
 
-            packet_type = first_byte & PACKET_TYPE_MASK
-            if packet_type == PACKET_TYPE_INITIAL:
+            packet_type = PACKET_LONG_TYPE_DECODE_VERSION_1[(first_byte & 0x30) >> 4]
+            if packet_type == QuicPacketType.INITIAL:
                 token_length = buf.pull_uint_var()
                 token = buf.pull_bytes(token_length)
                 rest_length = buf.pull_uint_var()
-            elif packet_type == PACKET_TYPE_RETRY:
+            elif packet_type == QuicPacketType.ZERO_RTT:
+                rest_length = buf.pull_uint_var()
+            elif packet_type == QuicPacketType.HANDSHAKE:
+                rest_length = buf.pull_uint_var()
+            else:
                 token_length = buf.capacity - buf.tell() - RETRY_INTEGRITY_TAG_SIZE
                 token = buf.pull_bytes(token_length)
                 integrity_tag = buf.pull_bytes(RETRY_INTEGRITY_TAG_SIZE)
                 rest_length = 0
-            else:
-                rest_length = buf.pull_uint_var()
 
             # check remainder length
             if rest_length > buf.capacity - buf.tell():
                 raise ValueError("Packet payload is truncated")
 
         return QuicHeader(
-            is_long_header=True,
             version=version,
             packet_type=packet_type,
             destination_cid=destination_cid,
@@ -194,12 +207,10 @@ def pull_quic_header(buf: Buffer, host_cid_length: Optional[int] = None) -> Quic
         if not (first_byte & PACKET_FIXED_BIT):
             raise ValueError("Packet fixed bit is zero")
 
-        packet_type = first_byte & PACKET_TYPE_MASK
         destination_cid = buf.pull_bytes(host_cid_length)
         return QuicHeader(
-            is_long_header=False,
             version=None,
-            packet_type=packet_type,
+            packet_type=QuicPacketType.ONE_RTT,
             destination_cid=destination_cid,
             source_cid=b"",
             token=b"",
@@ -221,7 +232,11 @@ def encode_quic_retry(
         + len(retry_token)
         + RETRY_INTEGRITY_TAG_SIZE
     )
-    buf.push_uint8(PACKET_TYPE_RETRY)
+    buf.push_uint8(
+        PACKET_LONG_HEADER
+        | PACKET_FIXED_BIT
+        | PACKET_LONG_TYPE_ENCODE_VERSION_1[QuicPacketType.RETRY] << 4
+    )
     buf.push_uint32(version)
     buf.push_uint8(len(destination_cid))
     buf.push_bytes(destination_cid)
