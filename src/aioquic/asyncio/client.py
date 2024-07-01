@@ -83,7 +83,7 @@ async def connect(
     )
     protocol = cast(QuicConnectionProtocol, protocol)
     try:
-        protocol.connect(addr)
+        protocol.connect(addr, transmit=wait_connected)
         if wait_connected:
             await protocol.wait_connected()
         yield protocol
