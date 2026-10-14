@@ -5429,6 +5429,18 @@ class QuicConnectionTest(QuicConnectionTestCase):
         self.assertAlmostEqual(client._remote_max_idle_timeout, 0.001)
         self.assertAlmostEqual(client._idle_timeout(), 0.6)
 
+        # Remote idle of 0s, meaning no preference, and local idle of 60s.
+        client = create_standalone_client(self)
+        data = encode_transport_parameters(
+            QuicTransportParameters(
+                original_destination_connection_id=client.original_destination_connection_id,
+                max_idle_timeout=0,
+            )
+        )
+        client._parse_transport_parameters(data)
+        self.assertEqual(client._remote_max_idle_timeout, 0.0)
+        self.assertAlmostEqual(client._idle_timeout(), 60.0)
+
     def test_parse_transport_parameters_malformed(self) -> None:
         client = create_standalone_client(self)
 

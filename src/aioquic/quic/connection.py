@@ -744,7 +744,8 @@ class QuicConnection:
 
         # Start with our local timeout.
         idle_timeout = self._configuration.idle_timeout
-        if self._remote_max_idle_timeout is not None:
+        # A peer advertising 0 has no preference (RFC 9000 section 10.1).
+        if self._remote_max_idle_timeout:
             # Our peer has a preference too, so pick the smaller timeout.
             idle_timeout = min(idle_timeout, self._remote_max_idle_timeout)
         # But not too small!
