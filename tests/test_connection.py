@@ -442,6 +442,83 @@ class QuicConnectionLossTest(QuicConnectionTestCase):
         client._packet_number = builder.packet_number
         return datagrams[0]
 
+    def test_connect_with_0rtt_and_amplification_limited_response(self):
+        """
+        Check a server whose anti-amplification limit prevents it from sending
+        a due ACK does not keep firing its ACK timer until it receives a datagram
+        (RFC 9000 section 8.1).
+
+        The server answers a 0-RTT request with 0.5-RTT data until it has sent
+        three times the data it received, before its ACK delay expires. The ACK
+        remains pending, and is sent once a datagram raises the limit, even
+        though its packets are discarded (RFC 9002 appendix A.6).
+        """
+        client_ticket, ticket_store = self.create_session_ticket()
+
+        def patch(server):
+            server._ack_delay = K_GRANULARITY
+
+        with client_and_server(
+            client_options={"session_ticket": client_ticket},
+            handshake=False,
+            server_kwargs={"session_ticket_fetcher": ticket_store.pop},
+            server_patch=patch,
+        ) as (client, server):
+            self.watch_timers(client, server)
+
+            # Client sends INITIAL + 0-RTT request.
+            now = 0.0
+            client.connect(SERVER_ADDR, now=now)
+            stream_id = client.get_next_available_stream_id()
+            client.send_stream_data(stream_id, b"GET /", end_stream=True)
+            client_items = client.datagrams_to_send(now=now)
+            self.assertEqual(datagram_sizes(client_items), [1200])
+            self.assertEqual(client.get_timer(), 0.2)
+            self.assertSentPackets(client, [1, 0, 1])
+            self.assertEvents(client, [])
+
+            # Server receives INITIAL + 0-RTT request, sends INITIAL + HANDSHAKE
+            # and 0.5-RTT data until the anti-amplification limit.
+            now = self.advance_by_tick(now)
+            server.receive_datagram(client_items[0][0], CLIENT_ADDR, now=now)
+            server.send_stream_data(stream_id, bytes(100000), end_stream=True)
+            items = server.datagrams_to_send(now=now)
+            self.assertEqual(datagram_sizes(items), [1200, 1200, 1200])
+            self.assertAlmostEqual(server.get_timer(), 0.051)
+            self.assertSentPackets(server, [1, 1, 3])
+            self.assertEvents(
+                server, [events.ProtocolNegotiated, events.StreamDataReceived]
+            )
+
+            # Server's ACK timer fires, but it cannot send the ACK, so only its
+            # PTO remains.
+            now = self.advance_to_timer(now, server)
+            server.handle_timer(now=now)
+            self.assertEqual(datagram_sizes(server.datagrams_to_send(now=now)), [])
+            self.assertAlmostEqual(server.get_timer(), 0.25)
+            self.assertSentPackets(server, [1, 1, 3])
+            self.assertEvents(server, [])
+
+            # Server receives a duplicate of the client's datagram, whose packets
+            # it discards, but which raises its anti-amplification limit, so it
+            # sends the pending ACK and more 0.5-RTT data.
+            now = self.advance_by_tick(now)
+            server.receive_datagram(client_items[0][0], CLIENT_ADDR, now=now)
+            items = server.datagrams_to_send(now=now)
+            self.assertEqual(datagram_sizes(items), [1200, 1200, 1200])
+            self.assertTrue(
+                any(
+                    handler == server._on_ack_delivery
+                    for packet in server._spaces[
+                        tls.Epoch.ONE_RTT
+                    ].sent_packets.values()
+                    for handler, args in packet.delivery_handlers
+                )
+            )
+            self.assertAlmostEqual(server.get_timer(), 0.25)
+            self.assertSentPackets(server, [1, 1, 6])
+            self.assertEvents(server, [])
+
     def test_connect_with_0rtt_and_lost_client_first_flight(self):
         """
         Check the client pads datagrams carrying INITIAL packets to 1200 bytes

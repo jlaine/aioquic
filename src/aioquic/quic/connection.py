@@ -293,6 +293,7 @@ class QuicConnection:
 
         self._ack_delay = K_GRANULARITY
         self._ack_eliciting_sent_since_receipt = False
+        self._amplification_blocked = False
         self._close_at: Optional[float] = None
         self._close_event: Optional[events.ConnectionTerminated] = None
         self._connect_called = False
@@ -606,6 +607,13 @@ class QuicConnection:
             except QuicPacketBuilderStop:
                 pass
 
+            # A due ACK which could not be sent on an unvalidated path is usually
+            # held back by the anti-amplification limit until a datagram arrives.
+            self._amplification_blocked = not network_path.is_validated and any(
+                space.ack_at is not None and space.ack_at <= now
+                for space in self._loss.spaces
+            )
+
         ret = self._flush_builder(
             builder=builder,
             network_path=network_path,
@@ -666,10 +674,11 @@ class QuicConnection:
         """
         timer_at = self._close_at
         if self._state not in END_STATES:
-            # ack timer
-            for space in self._loss.spaces:
-                if space.ack_at is not None and space.ack_at < timer_at:
-                    timer_at = space.ack_at
+            # ACK timer, unless the ACK cannot be sent until a datagram is received.
+            if not self._amplification_blocked:
+                for space in self._loss.spaces:
+                    if space.ack_at is not None and space.ack_at < timer_at:
+                        timer_at = space.ack_at
 
             # loss detection timer
             self._loss_at = self._loss.get_loss_detection_time()
@@ -797,6 +806,10 @@ class QuicConnection:
         network_path = self._find_network_path(addr)
         if not network_path.is_validated:
             network_path.bytes_received += payload_length
+
+        # Receiving a datagram unblocks a server blocked by the anti-amplification
+        # limit (RFC 9002 appendix A.6).
+        self._amplification_blocked = False
 
         # for servers, arm the idle timeout on the first datagram
         if self._close_at is None:
