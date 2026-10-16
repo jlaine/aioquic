@@ -1924,8 +1924,8 @@ class QuicConnectionLossTest(QuicConnectionTestCase):
         Check the server only arms its ACK timer on a path the client migrated to
         if the anti-amplification limit leaves room for an ACK: 1 byte of header,
         an 8-byte connection ID, a 2-byte packet number, 33 bytes reserved for
-        the ACK frame and a 16-byte AEAD tag. A probe would carry the ACK and a
-        new PATH_CHALLENGE, so it does not arm the PTO either.
+        the ACK frame and a 16-byte AEAD tag. A probe needs no room for the ACK,
+        so the PTO is armed first.
         """
         with client_and_server(handshake=False) as (client, server):
             self.watch_timers(client, server)
@@ -1959,9 +1959,10 @@ class QuicConnectionLossTest(QuicConnectionTestCase):
             self.assertEqual(datagram_sizes(items), [])
             self.assertAlmostEqual(server.get_timer(), 1.1125)
 
-            # 59 bytes of budget still leave no room for the ACK or a probe.
+            # 59 bytes of budget leave room for a probe but not for the ACK, so only
+            # the PTO is armed.
             network_path.bytes_sent -= 59
-            self.assertAlmostEqual(server.get_timer(), 1.1125)
+            self.assertAlmostEqual(server.get_timer(), 0.6375)
 
             # 60 bytes do for the ACK, so the ACK timer is armed.
             network_path.bytes_sent -= 1
@@ -2024,6 +2025,76 @@ class QuicConnectionLossTest(QuicConnectionTestCase):
             self.assertEqual(datagram_sizes(items), [36])
             self.assertEqual(items[0][1], NEW_CLIENT_ADDR)
             self.assertEqual(len(self.path_challenges(server)), 2)
+
+    def test_migrate_amplification_limit_probe_without_ack_room(self):
+        """
+        Check the server sends a probe on a path the client migrated to when the
+        anti-amplification limit leaves room for the probe but not for a due ACK,
+        which waits for the next datagram (RFC 9002 section 6.2.2.1).
+
+        The probe retransmits data sent before the client migrated, with a PING.
+        """
+        with client_and_server(handshake=False) as (client, server):
+            self.watch_timers(client, server)
+            now = self.handshake(client, server, now=0.0)
+
+            # Server sends stream data, which is lost.
+            server.send_stream_data(1, b"pong")
+            items = server.datagrams_to_send(now=now)
+            self.assertEqual(datagram_sizes(items), [35])
+            self.assertAlmostEqual(server.get_timer(), 0.5875)
+            self.assertSentPackets(server, [0, 0, 1])
+
+            # Client changes address and sends some data.
+            client.send_stream_data(0, b"01234567")
+            items = client.datagrams_to_send(now=now)
+            self.assertEqual(datagram_sizes(items), [39])
+            self.assertAlmostEqual(client.get_timer(), 0.625)
+
+            # Server receives the data, sends a PATH_CHALLENGE and an ACK padded up
+            # to the anti-amplification limit.
+            now = self.advance_by_tick(now)
+            server.receive_datagram(items[0][0], NEW_CLIENT_ADDR, now=now)
+            items = server.datagrams_to_send(now=now)
+            self.assertEqual(datagram_sizes(items), [3 * 39])
+            self.assertAlmostEqual(server.get_timer(), 1.1125)
+            self.assertSentPackets(server, [0, 0, 2])
+            self.assertEvents(server, [events.StreamDataReceived])
+            self.assertEqual(self.acked_ranges(server)[-1], [[4, 5]])
+
+            # Client sends a PING.
+            client.send_ping(1)
+            items = client.datagrams_to_send(now=now)
+            self.assertEqual(datagram_sizes(items), [29])
+            self.assertAlmostEqual(client.get_timer(), 0.675)
+
+            # Server receives the PING without the budget it brings, so it cannot
+            # send its ACK.
+            network_path = server._network_paths[0]
+            network_path.bytes_sent += 3 * 29
+            now = self.advance_by_tick(now)
+            server.receive_datagram(items[0][0], NEW_CLIENT_ADDR, now=now)
+            items = server.datagrams_to_send(now=now)
+            self.assertEqual(datagram_sizes(items), [])
+            self.assertAlmostEqual(server.get_timer(), 1.1125)
+            self.assertEvents(server, [])
+
+            # 59 bytes of budget leave room for a probe but not for the ACK, so only
+            # the PTO is armed.
+            network_path.bytes_sent -= 59
+            self.assertAlmostEqual(server.get_timer(), 0.6375)
+
+            # Server's PTO fires, its probe retransmits the stream data with a PING
+            # and leaves out the ACK, which still has no room.
+            now = self.advance_to_timer(now, server)
+            server.handle_timer(now=now)
+            items = server.datagrams_to_send(now=now)
+            self.assertEqual(datagram_sizes(items), [36])
+            self.assertEqual(items[0][1], NEW_CLIENT_ADDR)
+            self.assertAlmostEqual(server.get_timer(), 1.1125)
+            self.assertSentPackets(server, [0, 0, 2])
+            self.assertEvents(server, [])
+            self.assertEqual(self.acked_ranges(server)[-1], [[4, 5]])
 
     def test_migrate_to_spoofed_address(self):
         """

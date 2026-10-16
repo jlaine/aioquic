@@ -1390,11 +1390,9 @@ class QuicConnection:
         )
 
         if self._handshake_complete:
-            # Only a path the client migrated to is not validated. A probe on it may
-            # carry a new PATH_CHALLENGE, or older data after any due ACK.
+            # Only a path the client migrated to is not validated. A probe on it
+            # needs room for a new PATH_CHALLENGE at most, as an ACK can wait.
             probe_size = packet_overhead + PATH_CHALLENGE_FRAME_CAPACITY
-            if self._spaces[tls.Epoch.ONE_RTT].ack_at is not None:
-                probe_size += ACK_FRAME_CAPACITY
         else:
             # A probe may carry INITIAL data, which needs a full datagram (RFC 9000
             # section 14.1), and the client keeps sending until its address is
@@ -3649,7 +3647,12 @@ class QuicConnection:
                 and space.ack_at is not None
                 and space.ack_at <= now
             ):
-                self._write_ack_frame(builder=builder, space=space, now=now)
+                # An ACK the anti-amplification limit leaves no room for stays due,
+                # rather than holding back the frames which fit, such as a PING.
+                try:
+                    self._write_ack_frame(builder=builder, space=space, now=now)
+                except QuicPacketBuilderStop:
+                    pass
 
             if self._handshake_complete:
                 # HANDSHAKE_DONE
