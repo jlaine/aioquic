@@ -4236,6 +4236,10 @@ class QuicConnection:
         locally created unidirectional streams. We skip such streams to avoid
         spurious logging.
         """
+        # No more credit is needed once the final size is known (RFC 9000 section 13.3).
+        if stream.receiver.final_size is not None:
+            return
+
         if (
             stream.max_stream_data_local
             and stream.receiver.highest_offset * 2 > stream.max_stream_data_local

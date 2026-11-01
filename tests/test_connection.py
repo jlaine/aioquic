@@ -6205,6 +6205,61 @@ class QuicConnectionTest(QuicConnectionTestCase):
             self.assertEqual(client._local_max_data.value, 2097152)
             self.assertEqual(server._remote_max_data, 2097152)
 
+    def test_send_max_stream_data_after_fin(self) -> None:
+        # Raise the connection limit so that MAX_DATA is not sent.
+        with client_and_server(
+            client_options={"max_data": 2097152},
+        ) as (client, server):
+            # The client creates bidirectional stream 0.
+            stream = client._get_or_create_stream_for_send(stream_id=0)
+            client.send_stream_data(0, b"hello")
+            self.assertEqual(roundtrip(client, server), (1, 1))
+
+            # The client receives the FIN past half the limit, with data missing.
+            client._handle_stream_frame(
+                client_receive_context(client),
+                QuicFrameType.STREAM_BASE | 7,
+                Buffer(
+                    data=encode_uint_var(0)
+                    + encode_uint_var(524288)
+                    + encode_uint_var(1)
+                    + b"Z"
+                ),
+            )
+            self.assertEqual(stream.receiver.highest_offset, 524289)
+
+            # MAX_STREAM_DATA is not sent.
+            self.assertEqual(drop(client), 0)
+            self.assertEqual(stream.max_stream_data_local, 1048576)
+            self.assertEqual(stream.max_stream_data_local_sent, 1048576)
+
+    def test_send_max_stream_data_after_reset(self) -> None:
+        # Raise the connection limit so that MAX_DATA is not sent.
+        with client_and_server(
+            client_options={"max_data": 2097152},
+        ) as (client, server):
+            # The client creates bidirectional stream 0.
+            stream = client._get_or_create_stream_for_send(stream_id=0)
+            client.send_stream_data(0, b"hello")
+            self.assertEqual(roundtrip(client, server), (1, 1))
+
+            # The client receives RESET_STREAM past half the limit.
+            client._handle_reset_stream_frame(
+                client_receive_context(client),
+                QuicFrameType.RESET_STREAM,
+                Buffer(
+                    data=encode_uint_var(0)
+                    + encode_uint_var(QuicErrorCode.NO_ERROR)
+                    + encode_uint_var(524289)
+                ),
+            )
+            self.assertEqual(stream.receiver.highest_offset, 524289)
+
+            # MAX_STREAM_DATA is not sent.
+            self.assertEqual(drop(client), 0)
+            self.assertEqual(stream.max_stream_data_local, 1048576)
+            self.assertEqual(stream.max_stream_data_local_sent, 1048576)
+
     def test_send_max_stream_data_retransmit(self) -> None:
         with client_and_server() as (client, server):
             # client creates bidirectional stream 0
