@@ -12,6 +12,7 @@ from aioquic.h3.connection import (
     FrameType,
     FrameUnexpected,
     H3Connection,
+    HeadersState,
     MessageError,
     Setting,
     SettingsError,
@@ -2261,6 +2262,162 @@ class H3ConnectionTest(TestCase):
                     ],
                 )
 
+    def test_request_with_server_push_stop_sending(self) -> None:
+        """
+        A push stream on which the client asks the server to stop sending before
+        the server sends its HEADERS frame is closed.
+        """
+        with h3_client_and_server() as (quic_client, quic_server):
+            h3_client = H3Connection(quic_client)
+            h3_server = H3Connection(quic_server)
+            stream_id = self._send_request_headers(h3_client, h3_server)
+
+            # The server promises a push.
+            push_stream_id = h3_server.send_push_promise(
+                stream_id=stream_id,
+                headers=[
+                    (b":method", b"GET"),
+                    (b":scheme", b"https"),
+                    (b":authority", b"localhost"),
+                    (b":path", b"/app.txt"),
+                ],
+            )
+            h3_transfer(quic_server, h3_client)
+            self.assertNotIn(push_stream_id, h3_server._stream)
+
+            # The client asks the server to stop sending on the push stream.
+            quic_client.stop_stream(push_stream_id, ErrorCode.H3_REQUEST_CANCELLED)
+            self.assertEqual(h3_transfer(quic_client, h3_server), [])
+            self.assertNotIn(push_stream_id, h3_server._stream)
+
+            # The server cannot send the pushed response.
+            with self.assertRaises(FrameUnexpected) as cm:
+                h3_server.send_headers(
+                    stream_id=push_stream_id, headers=[(b":status", b"200")]
+                )
+            self.assertEqual(str(cm.exception), "stream was already ended")
+            self.assertNotIn(push_stream_id, h3_server._stream)
+
+    def test_send_after_sending_ended(self) -> None:
+        """
+        We should not send on a stream once sending has ended, even though its
+        state is kept while the request body is still being received.
+        """
+        with h3_client_and_server() as (quic_client, quic_server):
+            h3_client = H3Connection(quic_client)
+            h3_server = H3Connection(quic_server)
+
+            # The client sends request headers, the body is still to come.
+            stream_id = quic_client.get_next_available_stream_id()
+            h3_client.send_headers(
+                stream_id=stream_id,
+                headers=[
+                    (b":method", b"POST"),
+                    (b":scheme", b"https"),
+                    (b":authority", b"localhost"),
+                    (b":path", b"/"),
+                ],
+            )
+            events = h3_transfer(quic_client, h3_server)
+            self.assertEqual(len(events), 1)
+            self.assertIsInstance(events[0], HeadersReceived)
+
+            # The server sends the full response, the stream state is kept.
+            h3_server.send_headers(
+                stream_id=stream_id, headers=[(b":status", b"200")], end_stream=True
+            )
+            self.assertIn(stream_id, h3_server._stream)
+
+            # The server can no longer send headers, data or a push promise.
+            with self.assertRaises(FrameUnexpected) as cm:
+                h3_server.send_headers(
+                    stream_id=stream_id, headers=[(b"x-foo", b"bar")]
+                )
+            self.assertEqual(str(cm.exception), "stream was already ended")
+
+            with self.assertRaises(FrameUnexpected) as cm:
+                h3_server.send_data(
+                    stream_id=stream_id, data=b"hello", end_stream=False
+                )
+            self.assertEqual(str(cm.exception), "stream was already ended")
+
+            with self.assertRaises(FrameUnexpected) as cm:
+                h3_server.send_push_promise(
+                    stream_id=stream_id,
+                    headers=[
+                        (b":method", b"GET"),
+                        (b":scheme", b"https"),
+                        (b":authority", b"localhost"),
+                        (b":path", b"/app.txt"),
+                    ],
+                )
+            self.assertEqual(str(cm.exception), "stream was already ended")
+
+            # The failed calls left the stream state untouched.
+            self.assertEqual(
+                h3_server._stream[stream_id].headers_send_state,
+                HeadersState.AFTER_HEADERS,
+            )
+            self.assertEqual(h3_server._next_push_id, 0)
+
+            # The client receives the response, then ends the request body.
+            events = h3_transfer(quic_server, h3_client)
+            self.assertEqual(
+                events,
+                [
+                    HeadersReceived(
+                        headers=[(b":status", b"200")],
+                        stream_id=stream_id,
+                        stream_ended=True,
+                    )
+                ],
+            )
+            h3_client.send_data(stream_id=stream_id, data=b"body", end_stream=True)
+            self.assertEqual(
+                h3_transfer(quic_client, h3_server),
+                [DataReceived(data=b"body", stream_id=stream_id, stream_ended=True)],
+            )
+            self.assertNotIn(stream_id, h3_server._stream)
+
+    def test_send_after_stream_closed(self) -> None:
+        """
+        We should not send on a stream which ended, even though its state was
+        deleted.
+        """
+        with h3_client_and_server() as (quic_client, quic_server):
+            h3_client = H3Connection(quic_client)
+            h3_server = H3Connection(quic_server)
+            self._make_request(h3_client, h3_server)
+            self.assertNotIn(0, h3_client._stream)
+            self.assertNotIn(0, h3_server._stream)
+
+            for h3 in (h3_client, h3_server):
+                with self.assertRaises(FrameUnexpected) as cm:
+                    h3.send_headers(stream_id=0, headers=[(b"x-foo", b"bar")])
+                self.assertEqual(str(cm.exception), "stream was already ended")
+
+                with self.assertRaises(FrameUnexpected) as cm:
+                    h3.send_data(stream_id=0, data=b"hello", end_stream=True)
+                self.assertEqual(str(cm.exception), "stream was already ended")
+
+                # The stream state was not recreated.
+                self.assertNotIn(0, h3._stream)
+
+            # The server cannot push on the stream either, nor use up a push ID.
+            with self.assertRaises(FrameUnexpected) as cm:
+                h3_server.send_push_promise(
+                    stream_id=0,
+                    headers=[
+                        (b":method", b"GET"),
+                        (b":scheme", b"https"),
+                        (b":authority", b"localhost"),
+                        (b":path", b"/app.txt"),
+                    ],
+                )
+            self.assertEqual(str(cm.exception), "stream was already ended")
+            self.assertEqual(h3_server._next_push_id, 0)
+            self.assertNotIn(0, h3_server._stream)
+
     def test_send_data_after_trailers(self) -> None:
         """
         We should not send DATA after trailers.
@@ -2844,6 +3001,34 @@ class H3ConnectionTest(TestCase):
             # No Stream Cancellation is sent for unidirectional streams.
             self.assertEqual(h3_server._decoder_bytes_sent, 0)
 
+    def test_uni_stream_reset_before_data(self) -> None:
+        """
+        The IDs of the peer's unidirectional streams are not remembered once they
+        end, so a peer cannot leave gaps between them by resetting some streams
+        before sending any data.
+        """
+        with h3_client_and_server() as (quic_client, quic_server):
+            h3_server = H3Connection(quic_server)
+
+            for _ in range(10):
+                # Open a stream, then reset it before sending any data.
+                stream_id = quic_client.get_next_available_stream_id(
+                    is_unidirectional=True
+                )
+                quic_client.reset_stream(stream_id, ErrorCode.H3_REQUEST_CANCELLED)
+                self.assertEqual(h3_transfer(quic_client, h3_server), [])
+                self.assertNotIn(stream_id, h3_server._stream)
+
+                # Open a stream of a reserved type, then end it.
+                stream_id = quic_client.get_next_available_stream_id(
+                    is_unidirectional=True
+                )
+                quic_client.send_stream_data(stream_id, b"\x21", end_stream=True)
+                self.assertEqual(h3_transfer(quic_client, h3_server), [])
+                self.assertNotIn(stream_id, h3_server._stream)
+
+            self.assertEqual(list(h3_server._discarded_streams[2]), [])
+
     def test_request_with_interim_responses(self) -> None:
         """
         A server can send interim responses before the final response, see
@@ -3304,6 +3489,10 @@ class H3ConnectionTest(TestCase):
             self.assertEqual(len(h3_client._stream), 3)
             self.assertEqual(len(h3_server._stream), 3)
 
+            # The IDs of the request streams are remembered as a single range.
+            self.assertEqual(list(h3_client._discarded_streams[0]), [range(0, 6)])
+            self.assertEqual(list(h3_server._discarded_streams[0]), [range(0, 6)])
+
     def test_streams_are_closed_after_end_without_headers(self) -> None:
         """
         A request stream which ends before its HEADERS frame is received is
@@ -3400,6 +3589,12 @@ class H3ConnectionTest(TestCase):
             self.assertEqual(h3_transfer(quic_client, h3_server), [])
             self.assertNotIn(stream_id, h3_server._stream)
 
+            # The server cannot respond on the aborted stream.
+            with self.assertRaises(FrameUnexpected):
+                h3_server.send_headers(
+                    stream_id=stream_id, headers=[(b":status", b"200")]
+                )
+
             # The server aborts its response, which closes the QUIC stream.
             transfer(quic_server, quic_client)
             self.assertIn(
@@ -3426,6 +3621,74 @@ class H3ConnectionTest(TestCase):
             # The client asks the server to stop sending the response.
             quic_client.stop_stream(stream_id, ErrorCode.H3_REQUEST_CANCELLED)
             self.assertEqual(h3_transfer(quic_client, h3_server), [])
+            self.assertNotIn(stream_id, h3_server._stream)
+
+    def test_streams_are_closed_after_stop_sending_after_end(self) -> None:
+        """
+        A request stream on which the client asks the server to stop sending
+        after the server ended it is not reopened.
+        """
+        with h3_client_and_server() as (quic_client, quic_server):
+            h3_client = H3Connection(quic_client)
+            h3_server = H3Connection(quic_server)
+            stream_id = self._send_request_headers(h3_client, h3_server)
+
+            # The client finishes the request, the server sends the full response.
+            h3_client.send_data(stream_id=stream_id, data=b"", end_stream=True)
+            h3_transfer(quic_client, h3_server)
+            h3_server.send_headers(
+                stream_id=stream_id, headers=[(b":status", b"200")], end_stream=True
+            )
+            self.assertNotIn(stream_id, h3_server._stream)
+
+            # The client asks the server to stop sending before receiving it.
+            quic_client.stop_stream(stream_id, ErrorCode.H3_REQUEST_CANCELLED)
+            self.assertEqual(h3_transfer(quic_client, h3_server), [])
+            self.assertNotIn(stream_id, h3_server._stream)
+
+    def test_streams_are_closed_after_stop_sending_before_headers(self) -> None:
+        """
+        A request stream on which the client asks the server to stop sending
+        before its HEADERS frame is received is closed once the request ends.
+        """
+        with h3_client_and_server() as (quic_client, quic_server):
+            h3_client = H3Connection(quic_client)
+            h3_server = H3Connection(quic_server)
+
+            # The client opens a request stream, then asks the server to stop
+            # sending.
+            stream_id = quic_client.get_next_available_stream_id()
+            quic_client.send_stream_data(stream_id, b"")
+            quic_client.stop_stream(stream_id, ErrorCode.H3_REQUEST_CANCELLED)
+            self.assertEqual(h3_transfer(quic_client, h3_server), [])
+            self.assertIn(stream_id, h3_server._stream)
+
+            # The client sends the request.
+            headers = [
+                (b":method", b"GET"),
+                (b":scheme", b"https"),
+                (b":authority", b"localhost"),
+                (b":path", b"/"),
+            ]
+            h3_client.send_headers(
+                stream_id=stream_id, headers=headers, end_stream=True
+            )
+            self.assertEqual(
+                h3_transfer(quic_client, h3_server),
+                [
+                    HeadersReceived(
+                        headers=headers, stream_id=stream_id, stream_ended=True
+                    )
+                ],
+            )
+            self.assertNotIn(stream_id, h3_server._stream)
+
+            # The server cannot respond.
+            with self.assertRaises(FrameUnexpected) as cm:
+                h3_server.send_headers(
+                    stream_id=stream_id, headers=[(b":status", b"200")]
+                )
+            self.assertEqual(str(cm.exception), "stream was already ended")
             self.assertNotIn(stream_id, h3_server._stream)
 
     def test_streams_are_not_closed_prematurely(self) -> None:

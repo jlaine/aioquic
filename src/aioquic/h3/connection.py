@@ -29,6 +29,7 @@ from aioquic.quic.events import (
     StreamReset,
 )
 from aioquic.quic.logger import QuicLoggerTrace
+from aioquic.quic.rangeset import RangeSet
 
 logger = logging.getLogger("http3")
 
@@ -430,11 +431,6 @@ class H3Stream:
     def is_ended(self) -> bool:
         return self.sending_ended and self.receiving_ended and not self.blocked
 
-    def finish_sending(self) -> None:
-        if self.sending_ended:
-            raise FrameUnexpected("stream was already ended")
-        self.sending_ended = True
-
 
 class H3Connection:
     """
@@ -463,6 +459,10 @@ class H3Connection:
         self._encoder_bytes_sent = 0
         self._settings_received = False
         self._stream: dict[int, H3Stream] = {}
+        # The streams whose state was deleted once they ended, except the peer's
+        # unidirectional streams, by stream type, as `stream_id // 4` so that
+        # consecutive streams form a single range.
+        self._discarded_streams: list[RangeSet] = [RangeSet() for _ in range(4)]
 
         self._max_push_id: int | None = 8 if self._is_client else None
         self._next_push_id: int = 0
@@ -560,6 +560,9 @@ class H3Connection:
         If the stream ID is not a client-initiated bidirectional stream, an
         :class:`~aioquic.h3.exceptions.InvalidStreamTypeError` exception is raised.
 
+        If sending on the stream has already ended, a ``FrameUnexpected``
+        exception is raised.
+
         If there are not available push IDs, an
         :class:`~aioquic.h3.exceptions.NoAvailablePushIDError` exception is raised.
 
@@ -579,6 +582,7 @@ class H3Connection:
                 "Push promises can only be sent for client-initiated bidirectional "
                 "streams"
             )
+        self._check_sending_not_ended(stream_id)
 
         # check a push ID is available
         if self._max_push_id is None or self._next_push_id > self._max_push_id:
@@ -605,6 +609,9 @@ class H3Connection:
         """
         Send data on the given stream.
 
+        If sending on the stream has already ended, a ``FrameUnexpected``
+        exception is raised.
+
         .. aioquic_transmit::
 
         :param stream_id: The stream ID on which to send the data.
@@ -612,11 +619,12 @@ class H3Connection:
         :param end_stream: Whether to end the stream.
         """
         # check DATA frame is allowed
+        self._check_sending_not_ended(stream_id)
         with self._get_or_create_stream(stream_id) as stream:
             if stream.headers_send_state != HeadersState.AFTER_HEADERS:
                 raise FrameUnexpected("DATA frame is not allowed in this state")
             if end_stream:
-                stream.finish_sending()
+                stream.sending_ended = True
 
         # log frame
         if self._quic_logger is not None:
@@ -638,6 +646,9 @@ class H3Connection:
         """
         Send headers on the given stream.
 
+        If sending on the stream has already ended, a ``FrameUnexpected``
+        exception is raised.
+
         .. aioquic_transmit::
 
         :param stream_id: The stream ID on which to send the headers.
@@ -645,6 +656,7 @@ class H3Connection:
         :param end_stream: Whether to end the stream.
         """
         # check HEADERS frame is allowed
+        self._check_sending_not_ended(stream_id)
         with self._get_or_create_stream(stream_id) as stream:
             if stream.headers_send_state == HeadersState.AFTER_TRAILERS:
                 raise FrameUnexpected("HEADERS frame is not allowed in this state")
@@ -658,7 +670,7 @@ class H3Connection:
             if end_stream:
                 if interim:
                     raise FrameUnexpected("Interim response cannot end the stream")
-                stream.finish_sending()
+                stream.sending_ended = True
 
             frame_data = self._encode_headers(stream_id, headers)
 
@@ -703,6 +715,16 @@ class H3Connection:
         """
         self._quic.reset_stream(stream_id, ErrorCode.H3_REQUEST_INCOMPLETE)
 
+    def _check_sending_not_ended(self, stream_id: int) -> None:
+        """
+        Check sending on a stream has not ended, including once its state was
+        discarded, before anything is sent or its state is recreated.
+        """
+        if self._stream_is_discarded(stream_id) or (
+            stream_id in self._stream and self._stream[stream_id].sending_ended
+        ):
+            raise FrameUnexpected("stream was already ended")
+
     def _create_uni_stream(self, stream_type: int, push_id: int | None = None) -> int:
         """
         Create an unidirectional stream of the given type.
@@ -732,6 +754,20 @@ class H3Connection:
 
         return headers
 
+    def _discard_stream(self, stream_id: int) -> None:
+        """
+        Delete the state of a stream which ended, but remember its ID if we can
+        send on it.
+        """
+        self._stream.pop(stream_id, None)
+
+        # The peer could leave gaps between the IDs of its unidirectional streams
+        # by resetting some before sending any data.
+        if not stream_is_unidirectional(stream_id) or (
+            stream_is_client_initiated(stream_id) == self._is_client
+        ):
+            self._discarded_streams[stream_id % 4].add(stream_id // 4)
+
     def _encode_headers(self, stream_id: int, headers: Headers) -> bytes:
         """
         Encode a HEADERS block and send encoder updates on the encoder stream.
@@ -759,7 +795,7 @@ class H3Connection:
         finally:
             # Don't forget to delete stream objects when they are done
             if stream.is_ended():
-                self._stream.pop(stream_id)
+                self._discard_stream(stream_id)
 
     def _get_local_settings(self) -> dict[int, int]:
         """
@@ -775,6 +811,16 @@ class H3Connection:
             settings[Setting.H3_DATAGRAM] = 1
             settings[Setting.ENABLE_WEBTRANSPORT] = 1
         return settings
+
+    def _stream_is_discarded(self, stream_id: int) -> bool:
+        """
+        Return whether the stream ended and its state was deleted.
+        """
+        # Only a stream without state can have been discarded, so that streams
+        # with state do not search the discarded ones.
+        return stream_id not in self._stream and (
+            stream_id // 4 in self._discarded_streams[stream_id % 4]
+        )
 
     def _check_control_frame_type(self, frame_type: int) -> None:
         """
@@ -1121,12 +1167,13 @@ class H3Connection:
         ):
             raise ClosedCriticalStream("Stopping a critical stream is not allowed")
 
-        # The QUIC layer has already reset the sending part of the stream.
-        stream = self._stream.get(stream_id)
-        if stream is not None:
-            stream.sending_ended = True
-            if stream.is_ended():
-                self._stream.pop(stream_id)
+        # The QUIC layer has already reset the sending part of the stream. Keep
+        # track of it even if the stream has no state yet, so that nothing is
+        # sent on it and its state is deleted once receiving ends, but do not
+        # recreate the state of a stream which already ended.
+        if not self._stream_is_discarded(stream_id):
+            with self._get_or_create_stream(stream_id) as stream:
+                stream.sending_ended = True
 
     def _receive_stream_data(self, event: StreamDataReceived) -> list[H3Event]:
         stream_id = event.stream_id
@@ -1511,7 +1558,7 @@ class H3Connection:
 
             # The stream may have ended while it was blocked.
             if stream.is_ended():
-                self._stream.pop(stream_id)
+                self._discard_stream(stream_id)
 
         return http_events
 
@@ -1558,11 +1605,14 @@ class H3Connection:
             )
         ):
             self._abort_incomplete_request(stream_id)
-            if stream is not None:
+            if stream is None:
+                # Both halves of the stream are now finished.
+                self._discard_stream(stream_id)
+            else:
                 stream.sending_ended = True
 
         if stream is not None and stream.is_ended():
-            self._stream.pop(stream_id)
+            self._discard_stream(stream_id)
 
     def _validate_settings(self, settings: dict[int, int]) -> None:
         for setting in [
