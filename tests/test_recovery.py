@@ -31,13 +31,6 @@ def send_one_rtt_packets(
         )
 
 
-def send_probe() -> None:
-    """
-    Stand in for the connection, which would send an ack-eliciting packet
-    when the PTO fires.
-    """
-
-
 def send_watched_packets(
     recovery: QuicPacketRecovery, space: QuicPacketSpace, sent_times: dict[int, float]
 ) -> list[tuple[QuicDeliveryState, int]]:
@@ -180,12 +173,14 @@ class QuicPacketRecoveryTest(TestCase):
         self.HANDSHAKE_SPACE = QuicPacketSpace()
         self.ONE_RTT_SPACE = QuicPacketSpace(is_application_data=True)
 
+        # The number of probes requested, which the connection would send.
+        self.probes: list[int] = []
         self.recovery = QuicPacketRecovery(
             congestion_control_algorithm="reno",
             initial_rtt=0.1,
             max_datagram_size=1280,
             peer_completed_address_validation=True,
-            send_probe=send_probe,
+            send_probe=self.probes.append,
         )
         self.recovery.spaces = [
             self.INITIAL_SPACE,
@@ -426,12 +421,14 @@ class QuicPacketRecoveryTest(TestCase):
         )
         congestion_window = self.recovery.congestion_window
 
-        # The oldest packet's data is retransmitted, without a congestion event.
+        # The oldest packet's data is retransmitted, without a congestion event,
+        # and two probes are requested.
         self.recovery.on_loss_detection_timeout(now=2.0)
         self.assertEqual(deliveries, [(QuicDeliveryState.LOST, 0)])
         self.assertEqual(list(self.ONE_RTT_SPACE.sent_packets), [1])
         self.assertEqual(self.recovery.bytes_in_flight, 1280)
         self.assertEqual(self.recovery.congestion_window, congestion_window)
+        self.assertEqual(self.probes, [2])
 
     def test_on_loss_detection_timeout_retransmits_oldest_packet_unconfirmed(
         self,
@@ -585,7 +582,9 @@ class QuicPacketRecoveryTest(TestCase):
         self.recovery.handshake_confirmed = True
         deliveries = send_watched_packets(self.recovery, self.ONE_RTT_SPACE, {0: 1.0})
 
-        # Speeding up handshake completion only retransmits CRYPTO data.
+        # Speeding up handshake completion only retransmits CRYPTO data, in a
+        # single probe.
         self.recovery.reschedule_data(now=2.0, speed_up_handshake=True)
         self.assertEqual(deliveries, [])
         self.assertEqual(list(self.ONE_RTT_SPACE.sent_packets), [0])
+        self.assertEqual(self.probes, [1])

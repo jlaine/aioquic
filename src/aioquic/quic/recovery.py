@@ -135,7 +135,7 @@ class QuicPacketRecovery:
         initial_rtt: float,
         max_datagram_size: int,
         peer_completed_address_validation: bool,
-        send_probe: Callable[[], None],
+        send_probe: Callable[[int], None],
         logger: logging.LoggerAdapter | None = None,
         quic_logger: QuicLoggerTrace | None = None,
     ) -> None:
@@ -369,7 +369,7 @@ class QuicPacketRecovery:
             self._detect_loss(now=now, space=loss_space)
         else:
             self._pto_count += 1
-            self.reschedule_data(now=now)
+            self.reschedule_data(now=now, probes=2)
 
     def on_packet_sent(self, *, packet: QuicSentPacket, space: QuicPacketSpace) -> None:
         space.sent_packets[packet.packet_number] = packet
@@ -391,9 +391,12 @@ class QuicPacketRecovery:
             if self._quic_logger is not None:
                 self._log_metrics_updated()
 
-    def reschedule_data(self, *, now: float, speed_up_handshake: bool = False) -> None:
+    def reschedule_data(
+        self, *, now: float, probes: int = 1, speed_up_handshake: bool = False
+    ) -> None:
         """
-        Schedule some data for retransmission and request a probe.
+        Schedule some data for retransmission and request `probes` probe
+        datagrams.
 
         Outstanding handshake CRYPTO data, in INITIAL and HANDSHAKE packets, is
         retransmitted if there is any. Otherwise, so that a probe carries data
@@ -401,6 +404,10 @@ class QuicPacketRecovery:
         packet is retransmitted, unless `speed_up_handshake` is set, as speeding
         up handshake completion only involves CRYPTO data (RFC 9002 section
         6.2.3).
+
+        A PTO requests two probes, as RFC 9002 section 6.2.4 allows, so that a
+        single lost datagram does not cost another, longer PTO period. Data for
+        the second probe is scheduled once the first is sent.
 
         The packets are declared lost, although RFC 9002 section 6.2 says a PTO
         must not mark packets as lost, because delivery handlers expect a packet
@@ -453,7 +460,7 @@ class QuicPacketRecovery:
                 )
 
         # Ensure an ACK-eliciting packet is sent.
-        self._send_probe()
+        self._send_probe(probes)
 
     def _detect_loss(self, *, now: float, space: QuicPacketSpace) -> None:
         """

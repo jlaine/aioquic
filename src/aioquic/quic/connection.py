@@ -525,6 +525,7 @@ class QuicConnection:
         self._handshake_done_pending = False
         self._ping_pending: list[int] = []
         self._probe_pending = False
+        self._second_probe_pending = False
         self._retire_connection_ids: list[int] = []
         self._streams_blocked_pending = False
 
@@ -696,82 +697,23 @@ class QuicConnection:
 
         network_path = self._network_paths[0]
 
-        # build datagrams
-        builder = QuicPacketBuilder(
-            host_cid=self.host_cid,
-            is_client=self._is_client,
-            max_datagram_size=self._max_datagram_size,
-            packet_number=self._packet_number,
-            peer_cid=self._peer_cid.cid,
-            peer_token=self._peer_token,
-            quic_logger=self._quic_logger,
-            spin_bit=self._spin_bit,
-            version=self._version,
-        )
-        if self._close_pending:
-            epoch_packet_types = []
-            if not self._handshake_confirmed:
-                epoch_packet_types += [
-                    (tls.Epoch.INITIAL, QuicPacketType.INITIAL),
-                    (tls.Epoch.HANDSHAKE, QuicPacketType.HANDSHAKE),
-                ]
-            epoch_packet_types.append((tls.Epoch.ONE_RTT, QuicPacketType.ONE_RTT))
-            for epoch, packet_type in epoch_packet_types:
-                crypto = self._cryptos[epoch]
-                if crypto.send.is_valid():
-                    builder.start_packet(packet_type, crypto)
-                    self._write_connection_close_frame(
-                        builder=builder,
-                        epoch=epoch,
-                        error_code=self._close_event.error_code,
-                        frame_type=self._close_event.frame_type,
-                        reason_phrase=self._close_event.reason_phrase,
-                    )
-            self._logger.info(
-                "Connection close sent (code 0x%X, reason %s)",
-                self._close_event.error_code,
-                self._close_event.reason_phrase,
-            )
-            self._close_pending = False
-            self._close_begin(is_initiator=True, now=now)
-        else:
-            # Only pacing holding back this attempt sets the pacing time, so that an
-            # older one cannot stay in the past when something else holds it back,
-            # such as the anti-amplification limit (RFC 9002 section 7.7).
-            self._pacing_at = None
+        ret = self._build_datagrams(network_path=network_path, now=now)
 
-            # congestion control
-            builder.max_flight_bytes = (
-                self._loss.congestion_window - self._loss.bytes_in_flight
-            )
-            # RFC 9002 section 7 only lets probes exceed the congestion window.
-            # Deviate from it for stranded HANDSHAKE data, which would otherwise
-            # deadlock the handshake until the idle timeout.
-            if (
-                self._probe_pending or self._handshake_data_stranded()
-            ) and builder.max_flight_bytes < self._max_datagram_size:
-                builder.max_flight_bytes = self._max_datagram_size
-
-            # limit data on un-validated network paths
-            if not network_path.is_validated:
-                builder.max_total_bytes = (
-                    network_path.bytes_received * 3 - network_path.bytes_sent
-                )
-
-            try:
-                if not self._handshake_confirmed:
-                    for epoch in [tls.Epoch.INITIAL, tls.Epoch.HANDSHAKE]:
-                        self._write_handshake(builder, epoch, now)
-                self._write_application(builder, network_path, now)
-            except QuicPacketBuilderStop:
-                pass
-
-        ret = self._flush_builder(
-            builder=builder,
-            network_path=network_path,
-            peer_cid=self._peer_cid.cid,
-            now=now,
-        )
+        # A PTO sends a second probe with the data of the oldest packet in
+        # flight, which is the first probe if nothing else is, unless the first
+        # one already took two datagrams (RFC 9002 section 6.2.4). Scheduling it
+        # declares that packet lost, so it is skipped when the anti-amplification
+        # limit leaves no room for a probe.
+        if (
+            self._second_probe_pending
+            and not self._probe_pending
+            and self._state not in END_STATES
+        ):
+            self._second_probe_pending = False
+            _, probe_blocked = self._amplification_blocked_timers()
+            if len(ret) < 2 and not probe_blocked:
+                self._loss.reschedule_data(now=now)
+                ret += self._build_datagrams(network_path=network_path, now=now)
 
         if self._handshake_complete and self._state not in END_STATES:
             # RFC 9000 section 9.6.1 says that once the handshake is confirmed, the
@@ -1699,6 +1641,89 @@ class QuicConnection:
                 frame_type=frame_type,
                 reason_phrase="Stream is receive-only",
             )
+
+    def _build_datagrams(
+        self, network_path: QuicNetworkPath, now: float
+    ) -> list[tuple[bytes, NetworkAddress]]:
+        """
+        Build and register the datagrams to send on the main network path.
+        """
+        # build datagrams
+        builder = QuicPacketBuilder(
+            host_cid=self.host_cid,
+            is_client=self._is_client,
+            max_datagram_size=self._max_datagram_size,
+            packet_number=self._packet_number,
+            peer_cid=self._peer_cid.cid,
+            peer_token=self._peer_token,
+            quic_logger=self._quic_logger,
+            spin_bit=self._spin_bit,
+            version=self._version,
+        )
+        if self._close_pending:
+            epoch_packet_types = []
+            if not self._handshake_confirmed:
+                epoch_packet_types += [
+                    (tls.Epoch.INITIAL, QuicPacketType.INITIAL),
+                    (tls.Epoch.HANDSHAKE, QuicPacketType.HANDSHAKE),
+                ]
+            epoch_packet_types.append((tls.Epoch.ONE_RTT, QuicPacketType.ONE_RTT))
+            for epoch, packet_type in epoch_packet_types:
+                crypto = self._cryptos[epoch]
+                if crypto.send.is_valid():
+                    builder.start_packet(packet_type, crypto)
+                    self._write_connection_close_frame(
+                        builder=builder,
+                        epoch=epoch,
+                        error_code=self._close_event.error_code,
+                        frame_type=self._close_event.frame_type,
+                        reason_phrase=self._close_event.reason_phrase,
+                    )
+            self._logger.info(
+                "Connection close sent (code 0x%X, reason %s)",
+                self._close_event.error_code,
+                self._close_event.reason_phrase,
+            )
+            self._close_pending = False
+            self._close_begin(is_initiator=True, now=now)
+        else:
+            # Only pacing holding back this attempt sets the pacing time, so that an
+            # older one cannot stay in the past when something else holds it back,
+            # such as the anti-amplification limit (RFC 9002 section 7.7).
+            self._pacing_at = None
+
+            # congestion control
+            builder.max_flight_bytes = (
+                self._loss.congestion_window - self._loss.bytes_in_flight
+            )
+            # RFC 9002 section 7 only lets probes exceed the congestion window.
+            # Deviate from it for stranded HANDSHAKE data, which would otherwise
+            # deadlock the handshake until the idle timeout.
+            if (
+                self._probe_pending or self._handshake_data_stranded()
+            ) and builder.max_flight_bytes < self._max_datagram_size:
+                builder.max_flight_bytes = self._max_datagram_size
+
+            # limit data on un-validated network paths
+            if not network_path.is_validated:
+                builder.max_total_bytes = (
+                    network_path.bytes_received * 3 - network_path.bytes_sent
+                )
+
+            try:
+                if not self._handshake_confirmed:
+                    for epoch in [tls.Epoch.INITIAL, tls.Epoch.HANDSHAKE]:
+                        self._write_handshake(builder, epoch, now)
+                self._write_application(builder, network_path, now)
+            except QuicPacketBuilderStop:
+                pass
+
+        return self._flush_builder(
+            builder=builder,
+            network_path=network_path,
+            peer_cid=self._peer_cid.cid,
+            now=now,
+        )
 
     def _consume_peer_cid(self) -> None:
         """
@@ -3636,8 +3661,9 @@ class QuicConnection:
             self._crypto_streams[epoch].sender.write(buf.data)
             buf.seek(0)
 
-    def _send_probe(self) -> None:
+    def _send_probe(self, probes: int) -> None:
         self._probe_pending = True
+        self._second_probe_pending = probes > 1
 
     def _parse_transport_parameters(
         self, extensions: Iterable[tls.Extension], from_session_ticket: bool = False
